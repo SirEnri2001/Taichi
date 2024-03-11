@@ -7,7 +7,7 @@
 - **Python version** 3.10.11
 
 ## Implementation of Spring-Damper System
-This implementation is a naive way to calculate a spring-damper system on a line. 
+This implementation is a naive way to calculate a spring-damper system on a 1-D line. 
 ```python
 import taichi as ti
 import numpy as np
@@ -48,3 +48,6 @@ def main():
 if __name__ == "__main__":
     main()
 ```
+
+## Taichi implementation for Fluid Simulation
+See main.ipynb
