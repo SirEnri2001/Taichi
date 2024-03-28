@@ -44,7 +44,7 @@ debug = False
 
 use_sparse_matrix = args.use_sp_mat
 #arch = args.arch
-ti.init(arch=ti.vulkan)
+ti.init(arch=ti.cpu)
 # if arch in ["x64", "cpu", "arm64"]:
 #     ti.init(arch=ti.cpu)
 # elif arch in ["cuda", "gpu"]:

@@ -1,59 +1,70 @@
-# 2D Euler Fluid Simulation using Taichi, originally created by @Lee-abcde
-from taichi.examples.patterns import taichi_logo
+# References:
+# http://developer.download.nvidia.com/books/HTML/gpugems/gpugems_ch38.html
+# https://github.com/PavelDoGreat/WebGL-Fluid-Simulation
+# https://www.bilibili.com/video/BV1ZK411H7Hc?p=4
+# https://github.com/ShaneFX/GAMES201/tree/master/HW01
+
+import argparse
+
+import numpy as np
 
 import taichi as ti
-import taichi.math as tm
 
-ti.init(arch=ti.gpu)
+# How to run:
+#   `python stable_fluid.py`: use the jacobi iteration to solve the linear system.
+#   `python stable_fluid.py -S`: use a sparse matrix to do so.
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "-S",
+    "--use-sp-mat",
+    action="store_true",
+    help="Solve Poisson's equation by using a sparse matrix",
+)
+parser.add_argument(
+    "-a",
+    "--arch",
+    required=False,
+    default="cpu",
+    dest="arch",
+    type=str,
+    help="The arch (backend) to run this example on",
+)
+args, unknowns = parser.parse_known_args()
 
+res = 512
+dt = 0.03
+p_jacobi_iters = 500  # 40 for a quicker but less accurate result
+f_strength = 10000.0
+curl_strength = 0
+time_c = 2
+maxfps = 60
+dye_decay = 1 - 1 / (maxfps * time_c)
+force_radius = res / 2.0
+debug = False
 
-#####################
-#   Bilinear Interpolation function
-#####################
-@ti.func
-def sample(vf, u, v, shape):
-    i, j = int(u), int(v)
-    # Nearest
-    i = ti.max(0, ti.min(shape[0] - 1, i))
-    j = ti.max(0, ti.min(shape[1] - 1, j))
-    return vf[i, j]
+use_sparse_matrix = False
+arch = args.arch
+# if arch in ["x64", "cpu", "arm64"]:
+#     ti.init(arch=ti.cpu)
+# elif arch in ["cuda", "gpu"]:
+#     ti.init(arch=ti.cuda)
+# else:
+#     raise ValueError("Only CPU and CUDA backends are supported for now.")
+ti.init(arch=ti.cuda)
+if use_sparse_matrix:
+    print("Using sparse matrix")
+else:
+    print("Using jacobi iteration")
 
+_velocities = ti.Vector.field(2, float, shape=(res, res))
+_new_velocities = ti.Vector.field(2, float, shape=(res, res))
+velocity_divs = ti.field(float, shape=(res, res))
+velocity_curls = ti.field(float, shape=(res, res))
+_pressures = ti.field(float, shape=(res, res))
+_new_pressures = ti.field(float, shape=(res, res))
+_dye_buffer = ti.Vector.field(3, float, shape=(res, res))
+_new_dye_buffer = ti.Vector.field(3, float, shape=(res, res))
 
-@ti.func
-def lerp(vl, vr, frac):
-    # frac: [0.0, 1.0]
-    return (1 - frac) * vl + frac * vr
-
-
-@ti.func
-def bilerp(vf, u, v, shape):
-    # use -0.5 to decide where bilerp performs in cells
-    s, t = u - 0.5, v - 0.5
-    iu, iv = int(s), int(t)
-    a = sample(vf, iu + 0.5, iv + 0.5, shape)
-    b = sample(vf, iu + 1.5, iv + 0.5, shape)
-    c = sample(vf, iu + 0.5, iv + 1.5, shape)
-    d = sample(vf, iu + 1.5, iv + 1.5, shape)
-    # fract
-    fu, fv = s - iu, t - iv
-    return lerp(lerp(a, b, fu), lerp(c, d, fu), fv)
-
-
-#####################
-#   Simulation parameters
-#####################
-eulerSimParam = {
-    "shape": [512, 512],
-    "dt": 1 / 60.0,
-    "iteration_step": 20,
-    "mouse_radius": 0.01,  # [0.0,1.0] float
-    "mouse_speed": 125.0,
-    "mouse_respondDistance": 0.5,  # for every frame, only half the trace of the mouse will influence water
-    "curl_param": 15,
-}
-
-
-#   Double Buffer
 class TexPair:
     def __init__(self, cur, nxt):
         self.cur = cur
@@ -63,253 +74,337 @@ class TexPair:
         self.cur, self.nxt = self.nxt, self.cur
 
 
-velocityField = ti.Vector.field(2, float, shape=(eulerSimParam["shape"]))
-_new_velocityField = ti.Vector.field(2, float, shape=(eulerSimParam["shape"]))
-colorField = ti.Vector.field(3, float, shape=(eulerSimParam["shape"]))
-_new_colorField = ti.Vector.field(3, float, shape=(eulerSimParam["shape"]))
+velocities_pair = TexPair(_velocities, _new_velocities)
+pressures_pair = TexPair(_pressures, _new_pressures)
+dyes_pair = TexPair(_dye_buffer, _new_dye_buffer)
 
-curlField = ti.field(float, shape=(eulerSimParam["shape"]))
+if use_sparse_matrix:
+    # use a sparse matrix to solve Poisson's pressure equation.
+    @ti.kernel
+    def fill_laplacian_matrix(A: ti.types.sparse_matrix_builder()):
+        for i, j in ti.ndrange(res, res):
+            row = i * res + j
+            center = 0.0
+            if j != 0:
+                A[row, row - 1] += -1.0
+                center += 1.0
+            if j != res - 1:
+                A[row, row + 1] += -1.0
+                center += 1.0
+            if i != 0:
+                A[row, row - res] += -1.0
+                center += 1.0
+            if i != res - 1:
+                A[row, row + res] += -1.0
+                center += 1.0
+            A[row, row] += center
 
-divField = ti.field(float, shape=(eulerSimParam["shape"]))
-pressField = ti.field(float, shape=(eulerSimParam["shape"]))
-_new_pressField = ti.field(float, shape=(eulerSimParam["shape"]))
+    N = res * res
+    K = ti.linalg.SparseMatrixBuilder(N, N, max_num_triplets=N * 6)
+    F_b = ti.ndarray(ti.f32, shape=N)
 
-velocities_pair = TexPair(velocityField, _new_velocityField)
-pressure_pair = TexPair(pressField, _new_pressField)
-color_pair = TexPair(colorField, _new_colorField)
+    fill_laplacian_matrix(K)
+    L = K.build()
+    solver = ti.linalg.SparseSolver(solver_type="LLT")
+    solver.analyze_pattern(L)
+    solver.factorize(L)
 
-acceleration_field = ti.Vector.field(2, float, shape=(eulerSimParam["shape"]))
+
+@ti.func
+def sample(qf, u, v):
+    I = ti.Vector([int(u), int(v)])
+    I = ti.max(0, ti.min(res - 1, I))
+    return qf[I]
+
+
+@ti.func
+def lerp(vl, vr, frac):
+    # frac: [0.0, 1.0]
+    return vl + frac * (vr - vl)
+
+
+@ti.func
+def bilerp(vf, p):
+    u, v = p
+    s, t = u - 0.5, v - 0.5
+    # floor
+    iu, iv = ti.floor(s), ti.floor(t)
+    # fract
+    fu, fv = s - iu, t - iv
+    a = sample(vf, iu, iv)
+    b = sample(vf, iu + 1, iv)
+    c = sample(vf, iu, iv + 1)
+    d = sample(vf, iu + 1, iv + 1)
+    return lerp(lerp(a, b, fu), lerp(c, d, fu), fv)
+
+
+# 3rd order Runge-Kutta
+@ti.func
+def backtrace(vf: ti.template(), p, dt_: ti.template()):
+    v1 = bilerp(vf, p)
+    p1 = p - 0.5 * dt_ * v1
+    v2 = bilerp(vf, p1)
+    p2 = p - 0.75 * dt_ * v2
+    v3 = bilerp(vf, p2)
+    p -= dt_ * ((2 / 9) * v1 + (1 / 3) * v2 + (4 / 9) * v3)
+    return p
 
 
 @ti.kernel
-def init_field():
-    # init pressure and velocity fieldfield
-    pressField.fill(0)
-    velocityField.fill(0)
-    acceleration_field.fill(0)
-    for i, j in ti.ndrange(eulerSimParam["shape"][0] * 4, eulerSimParam["shape"][1] * 4):
-        # 4x4 super sampling:
-        ret = taichi_logo(ti.Vector([i, j]) / (eulerSimParam["shape"][0] * 4))
-        colorField[i // 4, j // 4] += ret / 16
-
-
-# simple time integrator **Forward Euler**
-@ti.kernel
-def advection(vf: ti.template(), qf: ti.template(), new_qf: ti.template()):
+def advect(vf: ti.template(), qf: ti.template(), new_qf: ti.template()):
     for i, j in vf:
-        del_velocity = ti.Vector([sample(vf, i + 1, j, (eulerSimParam["shape"])) -
-                                  sample(vf, i - 1, j, (eulerSimParam["shape"])),
-                                  sample(vf, i, j + 1, (eulerSimParam["shape"])) -
-                                  sample(vf, i, j - 1, (eulerSimParam["shape"]))
-                                  ])
-        acceleration_field[i, j] = - vf[i, j].dot(del_velocity)
+        p = ti.Vector([i, j]) + 0.5
+        p = backtrace(vf, p, dt)
+        new_qf[i, j] = bilerp(qf, p) * dye_decay
 
+
+
+@ti.func
+def sample_mouse(x,y,imp_data: ti.types.ndarray()) -> float:
+    mouse_radius = 100.0
+    mouse_pos = ti.Vector([imp_data[2], imp_data[3]])
+    distance = ti.sqrt((ti.Vector([x,y]) - mouse_pos).norm() ** 2)
+    return ti.abs(distance - mouse_radius)
+
+@ti.func
+def smoothstep(edge0, edge1, x):
+    t = ti.max(0.0, ti.min((x-edge0)/(edge1 - edge0), 1.0))
+    return t*t*(3.0-2.0*t)
 
 @ti.kernel
-def curl(vf: ti.template(), cf: ti.template()):
+def apply_impulse(vf: ti.template(), dyef: ti.template(), imp_data: ti.types.ndarray()):
+    g_dir = -ti.Vector([0, 0]) * 300
     for i, j in vf:
-        cf[i, j] = 0.5 * ((vf[i + 1, j][1] - vf[i - 1, j][1]) - (vf[i, j + 1][0] - vf[i, j - 1][0]))
+        omx, omy = imp_data[2], imp_data[3]
+        mdir = ti.Vector([imp_data[0], imp_data[1]])
+        dx, dy = (i + 0.5 - omx), (j + 0.5 - omy)
+        d2 = dx * dx + dy * dy
+        # dv = F * dt
+        # factor = ti.exp(-d2 / force_radius)
+        factor = 1.0
+        dc = dyef[i, j]
+        a = dc.norm()
+
+        momentum = (mdir * factor + g_dir * a / (1 + a)) * dt
+
+        v = vf[i, j]
+        vf[i, j] = v + momentum
+        circle_distance = sample_mouse(i, j, imp_data)
+        q_factor = 10.0
+        circle_factor = smoothstep(0.0, q_factor, ti.max(q_factor-circle_distance, 0))
+        # circle_factor = ti.max(q_factor - circle_distance, 0)
+        vf[i, j] += -2*(vf[i, j] + mdir*10) * circle_factor
+        # add dye
+        dc += ti.exp(-d2 * (1 / (res / 15) ** 2)) * ti.Vector([imp_data[4], imp_data[5], imp_data[6]])
+
+        dyef[i, j] = dc
 
 
 @ti.kernel
-def vorticity_projection(cf: ti.template(), vf: ti.template(), vf_new: ti.template()):
-    for i, j in cf:
-        gradcurl = ti.Vector(
-            [
-                0.5 * (cf[i + 1, j] - cf[i - 1, j]),
-                0.5 * (cf[i, j + 1] - cf[i, j - 1]),
-                0,
-            ]
-        )
-        GradCurlLength = tm.length(gradcurl)
-        if GradCurlLength > 1e-5:
-            force = eulerSimParam["curl_param"] * tm.cross(gradcurl / GradCurlLength, ti.Vector([0, 0, 1]))
-            vf_new[i, j] = vf[i, j] + eulerSimParam["dt"] * force[:2]
-
-
-@ti.kernel
-def divergence(vf: ti.template(), divf: ti.template()):
+def divergence(vf: ti.template()):
     for i, j in vf:
-        divf[i, j] = 0.5 * (vf[i + 1, j][0] - vf[i - 1, j][0] + vf[i, j + 1][1] - vf[i, j - 1][1])
+        vl = sample(vf, i - 1, j)
+        vr = sample(vf, i + 1, j)
+        vb = sample(vf, i, j - 1)
+        vt = sample(vf, i, j + 1)
+        vc = sample(vf, i, j)
+        if i == 0:
+            vl.x = -200
+        if i == res - 1:
+            vr.x = -200
+        if j == 0:
+            vb.y = 0
+        if j == res - 1:
+            vt.y = 0
+        velocity_divs[i, j] = (vr.x - vl.x + vt.y - vb.y) * 0.5
+
+@ti.kernel
+def vorticity(vf: ti.template()):
+    for i, j in vf:
+        vl = sample(vf, i - 1, j)
+        vr = sample(vf, i + 1, j)
+        vb = sample(vf, i, j - 1)
+        vt = sample(vf, i, j + 1)
+        velocity_curls[i, j] = (vr.y - vl.y - vt.x + vb.x) * 0.5
 
 
 @ti.kernel
-def pressure_iteration(divf: ti.template(), pf: ti.template(), new_pf: ti.template()):
+def pressure_jacobi(pf: ti.template(), new_pf: ti.template()):
     for i, j in pf:
-        new_pf[i, j] = (pf[i + 1, j] + pf[i - 1, j] + pf[i, j - 1] + pf[i, j + 1] - divf[i, j]) / 4
-
-
-def pressure_solve(presspair: TexPair, divf: ti.template()):
-    for i in range(eulerSimParam["iteration_step"]):
-        pressure_iteration(divf, presspair.cur, presspair.nxt)
-        presspair.swap()
-        apply_p_bc(presspair.cur)
+        pl = sample(pf, i - 1, j)
+        pr = sample(pf, i + 1, j)
+        pb = sample(pf, i, j - 1)
+        pt = sample(pf, i, j + 1)
+        div = velocity_divs[i, j]
+        new_pf[i, j] = (pl + pr + pb + pt - div) * 0.25
 
 
 @ti.kernel
-def pressure_projection(pf: ti.template(), vf: ti.template(), vf_new: ti.template()):
+def subtract_gradient(vf: ti.template(), pf: ti.template()):
     for i, j in vf:
-        vf_new[i, j] = vf[i, j] - ti.Vector(
-            [
-                (
-                    p_with_boundary(pf, i + 1, j, eulerSimParam["shape"])
-                    - p_with_boundary(pf, i - 1, j, eulerSimParam["shape"])
-                )
-                / 2.0,
-                (
-                    p_with_boundary(pf, i, j + 1, eulerSimParam["shape"])
-                    - p_with_boundary(pf, i, j - 1, eulerSimParam["shape"])
-                )
-                / 2.0,
-            ]
-        )
-
-
-#####################
-# Boundry Condition
-#####################
-@ti.func
-def vel_with_boundary(vf: ti.template(), i: int, j: int, shape) -> ti.f32:
-    if (i <= 0) or (i >= shape[0] - 1) or (j >= shape[1] - 1) or (j <= 0):
-        vf[i, j] = ti.Vector([0.0, 0.0])
-    return vf[i, j]
-
-
-@ti.func
-def p_with_boundary(pf: ti.template(), i: int, j: int, shape) -> ti.f32:
-    if (
-        (i == j == 0)
-        or (i == shape[0] - 1 and j == shape[1] - 1)
-        or (i == 0 and j == shape[1] - 1)
-        or (i == shape[0] - 1 and j == 0)
-    ):
-        pf[i, j] = 0.0
-    elif i == 0:
-        pf[0, j] = pf[1, j]
-    elif j == 0:
-        pf[i, 0] = pf[i, 1]
-    elif i == shape[0] - 1:
-        pf[shape[0] - 1, j] = pf[shape[0] - 2, j]
-    elif j == shape[1] - 1:
-        pf[i, shape[1] - 1] = pf[i, shape[1] - 2]
-    return pf[i, j]
-
-
-@ti.func
-def c_with_boundary(cf: ti.template(), i: int, j: int, shape) -> ti.f32:
-    if (i <= 0) or (i >= shape[0] - 1) or (j >= shape[1] - 1) or (j <= 0):
-        cf[i, j] = ti.Vector([i, j]).norm()
-    return cf[i, j]
+        pl = sample(pf, i - 1, j)
+        pr = sample(pf, i + 1, j)
+        pb = sample(pf, i, j - 1)
+        pt = sample(pf, i, j + 1)
+        vf[i, j] -= 0.5 * ti.Vector([pr - pl, pt - pb])
 
 
 @ti.kernel
-def apply_vel_bc(vf: ti.template()):
+def enhance_vorticity(vf: ti.template(), cf: ti.template()):
+    # anti-physics visual enhancement...
     for i, j in vf:
-        vel_with_boundary(vf, i, j, eulerSimParam["shape"])
+        cl = sample(cf, i - 1, j)
+        cr = sample(cf, i + 1, j)
+        cb = sample(cf, i, j - 1)
+        ct = sample(cf, i, j + 1)
+        cc = sample(cf, i, j)
+        force = ti.Vector([abs(ct) - abs(cb), abs(cl) - abs(cr)]).normalized(1e-3)
+        force *= curl_strength * cc
+        vf[i, j] = ti.min(ti.max(vf[i, j] + force * dt, -1e3), 1e3)
 
 
 @ti.kernel
-def apply_p_bc(pf: ti.template()):
-    for i, j in pf:
-        p_with_boundary(pf, i, j, eulerSimParam["shape"])
+def copy_divergence(div_in: ti.template(), div_out: ti.types.ndarray()):
+    for I in ti.grouped(div_in):
+        div_out[I[0] * res + I[1]] = -div_in[I]
 
 
 @ti.kernel
-def apply_c_bc(cf: ti.template()):
-    for i, j in cf:
-        c_with_boundary(cf, i, j, eulerSimParam["shape"])
+def apply_pressure(p_in: ti.types.ndarray(), p_out: ti.template()):
+    for I in ti.grouped(p_out):
+        p_out[I] = p_in[I[0] * res + I[1]]
 
 
-def mouse_interaction(prev_posx: int, prev_posy: int):
-    mouse_x, mouse_y = window.get_cursor_pos()
-    mousePos_x = int(mouse_x * eulerSimParam["shape"][0])
-    mousePos_y = int(mouse_y * eulerSimParam["shape"][1])
-    if prev_posx == 0 and prev_posy == 0:
-        prev_posx = mousePos_x
-        prev_posy = mousePos_y
-    mouseRadius = eulerSimParam["mouse_radius"] * min(eulerSimParam["shape"][0], eulerSimParam["shape"][1])
+def solve_pressure_sp_mat():
+    copy_divergence(velocity_divs, F_b)
+    x = solver.solve(F_b)
+    apply_pressure(x, pressures_pair.cur)
 
-    mouse_addspeed(
-        mousePos_x,
-        mousePos_y,
-        prev_posx,
-        prev_posy,
-        mouseRadius,
-        velocities_pair.cur,
-        velocities_pair.nxt,
-    )
+
+def solve_pressure_jacobi():
+    for _ in range(p_jacobi_iters):
+        pressure_jacobi(pressures_pair.cur, pressures_pair.nxt)
+        pressures_pair.swap()
+
+
+def step(mouse_data):
+    advect(velocities_pair.cur, velocities_pair.cur, velocities_pair.nxt)
+    advect(velocities_pair.cur, dyes_pair.cur, dyes_pair.nxt)
     velocities_pair.swap()
-    prev_posx = mousePos_x
-    prev_posy = mousePos_y
-    return prev_posx, prev_posy
+    dyes_pair.swap()
+
+    apply_impulse(velocities_pair.cur, dyes_pair.cur, mouse_data)
+
+    divergence(velocities_pair.cur)
+
+    if curl_strength:
+        vorticity(velocities_pair.cur)
+        enhance_vorticity(velocities_pair.cur, velocity_curls)
+
+    if use_sparse_matrix:
+        solve_pressure_sp_mat()
+    else:
+        solve_pressure_jacobi()
+
+    subtract_gradient(velocities_pair.cur, pressures_pair.cur)
+
+    if debug:
+        divergence(velocities_pair.cur)
+        div_s = np.sum(velocity_divs.to_numpy())
+        print(f"divergence={div_s}")
 
 
-@ti.kernel
-def mouse_addspeed(
-    cur_posx: int,
-    cur_posy: int,
-    prev_posx: int,
-    prev_posy: int,
-    mouseRadius: float,
-    vf: ti.template(),
-    new_vf: ti.template(),
-):
-    for i, j in vf:
-        vec1 = ti.Vector([cur_posx - prev_posx, cur_posy - prev_posy])
-        vec2 = ti.Vector([i - prev_posx, j - prev_posy])
-        dotans = tm.dot(vec1, vec2)
-        distance = abs(tm.cross(vec1, vec2)) / (tm.length(vec1) + 0.001)
-        if (
-            dotans >= 0
-            and dotans <= eulerSimParam["mouse_respondDistance"] * tm.length(vec1)
-            and distance <= mouseRadius
-        ):
-            new_vf[i, j] = vf[i, j] + vec1 * eulerSimParam["mouse_speed"]
+class MouseDataGen:
+    def __init__(self):
+        self.prev_mouse = None
+        self.prev_color = None
+
+    def __call__(self, gui):
+        # [0:2]: normalized delta direction
+        # [2:4]: current mouse xy
+        # [4:7]: color
+        mouse_data = np.zeros(8, dtype=np.float32)
+        if gui.is_pressed(ti.GUI.LMB):
+            mxy = np.array(gui.get_cursor_pos(), dtype=np.float32) * res
+            if self.prev_mouse is None:
+                self.prev_mouse = mxy
+                # Set lower bound to 0.3 to prevent too dark colors
+                self.prev_color = (np.random.rand(3) * 0.7) + 0.3
+            else:
+                mdir = mxy - self.prev_mouse
+                mdir = mdir / (np.linalg.norm(mdir) + 1e-5)
+                mouse_data[0], mouse_data[1] = mdir[0], mdir[1]
+                mouse_data[2], mouse_data[3] = mxy[0], mxy[1]
+                mouse_data[4:7] = self.prev_color
+                self.prev_mouse = mxy
         else:
-            new_vf[i, j] = vf[i, j]
+            self.prev_mouse = None
+            self.prev_color = None
+        return mouse_data
 
 
-def advection_step():
-    advection(velocities_pair.cur, color_pair.cur, color_pair.nxt)
-    advection(velocities_pair.cur, velocities_pair.cur, velocities_pair.nxt)
-    color_pair.swap()
-    velocities_pair.swap()
-    apply_vel_bc(velocities_pair.cur)
+def reset():
+    velocities_pair.cur.fill(0)
+    pressures_pair.cur.fill(0)
+    dyes_pair.cur.fill(0)
 
 
-def vorticity_step():
-    curl(velocities_pair.cur, curlField)
-    apply_c_bc(curlField)
-    vorticity_projection(curlField, velocities_pair.cur, velocities_pair.nxt)
-    velocities_pair.swap()
-    apply_vel_bc(velocities_pair.cur)
+def main():
+    global debug, curl_strength
+    visualize_d = True  # visualize dye (default)
+    visualize_v = False  # visualize velocity
+    visualize_c = False  # visualize curl
+
+    paused = False
+
+    gui = ti.GUI("Stable Fluid", (res, res))
+    md_gen = MouseDataGen()
+
+    while gui.running:
+        if gui.get_event(ti.GUI.PRESS):
+            e = gui.event
+            if e.key == ti.GUI.ESCAPE:
+                break
+            elif e.key == "r":
+                paused = False
+                reset()
+            elif e.key == "s":
+                if curl_strength:
+                    curl_strength = 0
+                else:
+                    curl_strength = 7
+            elif e.key == "v":
+                visualize_v = True
+                visualize_c = False
+                visualize_d = False
+            elif e.key == "d":
+                visualize_d = True
+                visualize_v = False
+                visualize_c = False
+            elif e.key == "c":
+                visualize_c = True
+                visualize_d = False
+                visualize_v = False
+            elif e.key == "p":
+                paused = not paused
+            elif e.key == "d":
+                debug = not debug
+
+        # Debug divergence:
+        # print(max((abs(velocity_divs.to_numpy().reshape(-1)))))
+
+        if not paused:
+            mouse_data = md_gen(gui)
+            step(mouse_data)
+        if visualize_c:
+            vorticity(velocities_pair.cur)
+            gui.set_image(velocity_curls.to_numpy() * 0.03 + 0.5)
+        elif visualize_d:
+            gui.set_image(dyes_pair.cur)
+        elif visualize_v:
+            gui.set_image(velocities_pair.cur.to_numpy() * 0.01 + 0.5)
+        gui.show()
 
 
-def pressure_step():
-    divergence(velocities_pair.cur, divField)
-    pressure_solve(pressure_pair, divField)
-    pressure_projection(pressure_pair.cur, velocities_pair.cur, velocities_pair.nxt)
-    velocities_pair.swap()
-    apply_vel_bc(velocities_pair.cur)
-
-
-#####################
-# The Euler Simulation starts!
-#####################
-init_field()
-apply_vel_bc(velocities_pair.cur)
-window = ti.GUI("Euler 2D Simulation", res=(eulerSimParam["shape"][0], eulerSimParam["shape"][1]))
-
-mouse_prevposx, mouse_prevposy = 0, 0
-while window.running:
-    # advection
-    advection_step()
-    # curl
-    # vorticity_step()
-    # mouse interact with fluid
-    mouse_prevposx, mouse_prevposy = mouse_interaction(mouse_prevposx, mouse_prevposy)
-    # pressure iteration and projection
-    pressure_step()
-
-    window.set_image(colorField)
-    window.show()
+if __name__ == "__main__":
+    main()
